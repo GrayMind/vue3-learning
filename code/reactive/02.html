@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Document</title>
+  </head>
+  <body>
+    副作用函数的注册
+  </body>
+
+  <script>
+    // 用一个全局变量存储被注册的副作用函数
+    let activeEffect;
+    // effect 函数用于注册副作用函数
+    function effect(fn) {
+      // 当调用 effect 注册副作用函数时，将副作用函数fn赋值给 activeEffect
+      activeEffect = fn;
+      // 执行副作用函数
+      fn();
+    }
+    // 存储副作用函数的桶
+    const bucket = new Set();
+    // 原始数据
+    const data = { text: "hello world" };
+    // 对原始数据进行代理
+    const obj = new Proxy(data, {
+      // 拦截读取操作
+      get(target, key) {
+        // 将 activeEffect 中存储的副作用函数添加到桶中
+        if (activeEffect) {
+          bucket.add(activeEffect);
+        }
+        // 返回属性值
+        return target[key];
+      },
+      // 拦截设置操作
+      set(target, key, newVal) {
+        // 设置属性值
+        target[key] = newVal;
+        // 把副作用函数从桶中取出来并执行
+        bucket.forEach((fn) => fn());
+        // 返回 true 代表设置操作成功
+        return true;
+      },
+    });
+
+    effect(() => {
+      console.log("effect run"); // 会打印 3 次
+      document.body.innerHTML = obj.text;
+    });
+
+    setTimeout(() => {
+      obj.text = "hello world 3";
+    }, 1000);
+
+    setTimeout(() => {
+      // 设置 obj 中并不存在的属性，也会触发副作用函数的执行
+      obj.no_text = "hello world 4";
+    }, 2000);
+  </script>
+</html>
