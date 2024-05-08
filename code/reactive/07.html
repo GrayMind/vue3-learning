@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>调度执行</title>
+  </head>
+  <body></body>
+
+  <script>
+    // 用一个全局变量存储被注册的副作用函数
+    let activeEffect;
+    // effect 栈
+    const effectStack = [];
+    // effect 函数用于注册副作用函数
+    function effect(fn, options = {}) {
+      const effectFn = () => {
+        cleanup(effectFn);
+        // 当 effectFn 执行时，将其设置为当前激活的副作用函数
+        activeEffect = effectFn;
+        // 在调用副作用函数前，将当前副作用函数压栈
+        effectStack.push(activeEffect);
+        fn();
+        // 在当前副作用函数执行完毕后，将当前副作用函数弹出栈，并将 activeEffect 还原为之前的值
+        effectStack.pop();
+        activeEffect = effectStack[effectStack.length - 1];
+      };
+      // 将 options 挂载到 effectFn 上
+      effectFn.options = options;
+      // 用于存储所有与该副作用函数相关的依赖集合
+      effectFn.deps = [];
+      // 执行副作用函数
+      effectFn();
+    }
+    // 存储副作用函数的桶
+    // WeakMap: target -> Map
+    // Map: key -> Set
+    const bucket = new WeakMap();
+    // 原始数据
+    const data = { foo: 1 };
+    // 对原始数据进行代理
+    const obj = new Proxy(data, {
+      // 拦截读取操作
+      get(target, key) {
+        // 将副作用函数 activeEffect 添加到桶中
+        track(target, key);
+        // 返回属性值
+        return target[key];
+      },
+      // 拦截设置操作
+      set(target, key, newVal) {
+        // 设置属性值
+        target[key] = newVal;
+        // 把副作用函数从桶中取出来并执行
+        trigger(target, key);
+      },
+    });
+
+    // 在 get 拦截函数内调用 track 函数，追踪变化
+    function track(target, key) {
+      // 没有 activeEffect 直接返回对应的值
+      if (!activeEffect) return;
+
+      // 根据 target 从桶中获取 depsMap
+      let depsMap = bucket.get(target);
+      // 如果不存在，那么新建一个 Map 和 target 进行关联
+      if (!depsMap) {
+        bucket.set(target, (depsMap = new Map()));
+      }
+
+      // 再根据 key 从 depsMap 中获取 deps
+      let deps = depsMap.get(key);
+      // 若 deps 不存在，则创建一个 Set 和 key 进行关联
+      if (!deps) {
+        depsMap.set(key, (deps = new Set()));
+      }
+      // 将当前副作用函数添加桶里
+      deps.add(activeEffect);
+
+      activeEffect.deps.push(deps);
+    }
+
+    // 在 set 拦截函数内调用 trigger 函数，触发变化
+    function trigger(target, key) {
+      // 根据 target 从桶中获取 depsMap
+      const depsMap = bucket.get(target);
+      if (!depsMap) return;
+      // 根据 key 取得所有副作用函数 effets
+      const effects = depsMap.get(key);
+
+      const effectsToRun = new Set();
+      effects &&
+        effects.forEach((effectFn) => {
+          // 如果 trigger 触发执行的副作用函数和当前正在执行的副作用函数相同，则不触发执行
+          if (effectFn !== activeEffect) {
+            effectsToRun.add(effectFn);
+          }
+        });
+      // 执行副作用函数
+      effectsToRun.forEach((effectFn) => {
+        // 如果一个副作用函数存在调度器，则调用该调度器，并将副作用函数作为参数传递
+        if (effectFn.options.scheduler) {
+          effectFn.options.scheduler(effectFn);
+        } else {
+          // 否则直接执行副作用函数
+          effectFn();
+        }
+      });
+    }
+
+    function cleanup(effectFn) {
+      for (let index = 0; index < effectFn.deps.length; index++) {
+        const deps = effectFn.deps[index];
+        deps.delete(effectFn);
+      }
+
+      effectFn.deps.length = 0;
+    }
+
+    // 控制调用顺序
+    // effect(
+    //   () => {
+    //     console.log(obj.foo);
+    //   },
+    //   {
+    //     scheduler(fn) {
+    //       setTimeout(fn);
+    //     },
+    //   }
+    // );
+
+    // 定义一个任务队列
+    const jobQueue = new Set();
+    // 创建一个 promise 实力，我们用它将一个任务添加到微任务队列
+    const p = Promise.resolve();
+
+    // 标志，代表是否正在刷新列表
+    let isFlushing = false;
+    function flushJob() {
+      // 如果正在刷新，则什么都不做
+      if (isFlushing) return;
+      // 设置 true， 表示正在刷新
+      isFlushing = true;
+      // 在微任务队列中刷新 jobQueue 队列
+      p.then(() => {
+        jobQueue.forEach((job) => job());
+      }).finally(() => {
+        // 结束后重置 isFlushing
+        isFlushing = false;
+      });
+    }
+
+    // 控制副作用函数的执行次数
+    effect(
+      () => {
+        console.log(obj.foo);
+      },
+      {
+        scheduler(fn) {
+          jobQueue.add(fn);
+          flushJob();
+        },
+      }
+    );
+
+    obj.foo++;
+    obj.foo++;
+    console.log("结束了");
+  </script>
+</html>
