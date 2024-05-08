@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Document</title>
+  </head>
+  <body></body>
+
+  <script>
+    // 用一个全局变量存储被注册的副作用函数
+    let activeEffect;
+    // effect 栈
+    const effectStack = [];
+    // effect 函数用于注册副作用函数
+    function effect(fn, options = {}) {
+      const effectFn = () => {
+        cleanup(effectFn);
+        // 当 effectFn 执行时，将其设置为当前激活的副作用函数
+        activeEffect = effectFn;
+        // 在调用副作用函数前，将当前副作用函数压栈
+        effectStack.push(activeEffect);
+        const res = fn();
+        // 在当前副作用函数执行完毕后，将当前副作用函数弹出栈，并将 activeEffect 还原为之前的值
+        effectStack.pop();
+        activeEffect = effectStack[effectStack.length - 1];
+        return res;
+      };
+      // 将 options 挂载到 effectFn 上
+      effectFn.options = options;
+      // 用于存储所有与该副作用函数相关的依赖集合
+      effectFn.deps = [];
+      if (!options.lazy) {
+        // 执行副作用函数
+        effectFn();
+      }
+      return effectFn;
+    }
+
+    // 存储副作用函数的桶
+    // WeakMap: target -> Map
+    // Map: key -> Set
+    const bucket = new WeakMap();
+    // 原始数据
+    const data = { foo: 1, bar: 2 };
+    // 对原始数据进行代理
+    const obj = new Proxy(data, {
+      // 拦截读取操作
+      get(target, key) {
+        // 将副作用函数 activeEffect 添加到桶中
+        track(target, key);
+        // 返回属性值
+        return target[key];
+      },
+      // 拦截设置操作
+      set(target, key, newVal) {
+        // 设置属性值
+        target[key] = newVal;
+        // 把副作用函数从桶中取出来并执行
+        trigger(target, key);
+      },
+    });
+
+    // 在 get 拦截函数内调用 track 函数，追踪变化
+    function track(target, key) {
+      // 没有 activeEffect 直接返回对应的值
+      if (!activeEffect) return;
+
+      // 根据 target 从桶中获取 depsMap
+      let depsMap = bucket.get(target);
+      // 如果不存在，那么新建一个 Map 和 target 进行关联
+      if (!depsMap) {
+        bucket.set(target, (depsMap = new Map()));
+      }
+
+      // 再根据 key 从 depsMap 中获取 deps
+      let deps = depsMap.get(key);
+      // 若 deps 不存在，则创建一个 Set 和 key 进行关联
+      if (!deps) {
+        depsMap.set(key, (deps = new Set()));
+      }
+      // 将当前副作用函数添加桶里
+      deps.add(activeEffect);
+
+      activeEffect.deps.push(deps);
+    }
+
+    // 在 set 拦截函数内调用 trigger 函数，触发变化
+    function trigger(target, key) {
+      // 根据 target 从桶中获取 depsMap
+      const depsMap = bucket.get(target);
+      if (!depsMap) return;
+      // 根据 key 取得所有副作用函数 effets
+      const effects = depsMap.get(key);
+
+      const effectsToRun = new Set();
+      effects &&
+        effects.forEach((effectFn) => {
+          // 如果 trigger 触发执行的副作用函数和当前正在执行的副作用函数相同，则不触发执行
+          if (effectFn !== activeEffect) {
+            effectsToRun.add(effectFn);
+          }
+        });
+      // 执行副作用函数
+      effectsToRun.forEach((effectFn) => {
+        // 如果一个副作用函数存在调度器，则调用该调度器，并将副作用函数作为参数传递
+        if (effectFn.options.scheduler) {
+          effectFn.options.scheduler(effectFn);
+        } else {
+          // 否则直接执行副作用函数
+          effectFn();
+        }
+      });
+    }
+
+    function cleanup(effectFn) {
+      for (let index = 0; index < effectFn.deps.length; index++) {
+        const deps = effectFn.deps[index];
+        deps.delete(effectFn);
+      }
+
+      effectFn.deps.length = 0;
+    }
+
+    function computed(getter) {
+      // 对值进行缓存
+      let value;
+
+      // 标识是否需要重新计算
+      let dirty = true;
+
+      const effectFn = effect(getter, {
+        lazy: true,
+        scheduler() {
+          if (!dirty) {
+            dirty = true;
+            trigger(obj, "value");
+          }
+        },
+      });
+
+      const obj = {
+        get value() {
+          if (dirty) {
+            value = effectFn();
+            dirty = false;
+          }
+          track(obj, "value");
+          return value;
+        },
+      };
+      return obj;
+    }
+
+    // function watch(source, cb) {
+    //   effect(() => source.foo, {
+    //     scheduler(fn) {
+    //       cb();
+    //     },
+    //   });
+    // }
+
+    // function watch(source, cb) {
+    //   // 递归读取
+    //   effect(() => traverse(source), {
+    //     scheduler(fn) {
+    //       // 发生变化时，调用 callback
+    //       cb();
+    //     },
+    //   });
+    // }
+
+    // function watch(source, cb) {
+    //   let getter;
+    //   // 兼容 source 是 function 的情况
+    //   if (typeof source === "function") {
+    //     getter = source;
+    //   } else {
+    //     getter = () => traverse(source);
+    //   }
+    //   // 递归读取
+    //   effect(() => getter(), {
+    //     scheduler(fn) {
+    //       // 发生变化时，调用 callback
+    //       cb();
+    //     },
+    //   });
+    // }
+
+    // function watch(source, cb) {
+    //   let getter;
+    //   // 兼容 source 是 function 的情况
+    //   if (typeof source === "function") {
+    //     getter = source;
+    //   } else {
+    //     getter = () => traverse(source);
+    //   }
+
+    //   let oldVal, newVal;
+    //   // 递归读取
+    //   let effectFn = effect(() => getter(), {
+    //     lazy: true,
+    //     scheduler(fn) {
+    //       newVal = effectFn();
+    //       // 发生变化时，调用 callback
+    //       cb(newVal, oldVal);
+    //       oldVal = newVal;
+    //     },
+    //   });
+
+    //   oldVal = effectFn();
+    // }
+
+    // function watch(source, cb, options = {}) {
+    //   let getter;
+    //   if (typeof source === "function") {
+    //     getter = source;
+    //   } else {
+    //     getter = () =>traverse(source);
+    //   }
+
+    //   let oldVal, newVal;
+    //   const job = () => {
+    //     newVal = effectFn();
+    //     cb(newVal, oldVal);
+    //     oldVal = newVal;
+    //   };
+    //   const effectFn = effect(() => getter(), {
+    //     lazy: true,
+    //     scheduler: () => {
+    //       job();
+    //     },
+    //   });
+    //   if (options.immediate) {
+    //     job();
+    //   } else {
+    //     oldVal = effectFn();
+    //   }
+    // }
+
+    function watch(source, cb, options = {}) {
+      let getter;
+      if (typeof source === "function") {
+        getter = source;
+      } else {
+        getter = () => traverse(source);
+      }
+
+      let oldVal, newVal;
+      const job = () => {
+        newVal = effectFn();
+        cb(newVal, oldVal);
+        oldVal = newVal;
+      };
+      const effectFn = effect(() => getter(), {
+        lazy: true,
+        scheduler: () => {
+          if (options.flush === "post") {
+            const p = Promise.resolve();
+            p.then(job);
+          } else {
+            job();
+          }
+        },
+      });
+      if (options.immediate) {
+        job();
+      } else {
+        oldVal = effectFn();
+      }
+    }
+
+    function traverse(value, seen = new Set()) {
+      if (typeof value !== "object" || value === null || seen.has(value)) {
+        return;
+      }
+
+      seen.add(value);
+
+      for (const key in value) {
+        traverse(value[key], seen);
+      }
+      return value;
+    }
+
+    // watch(obj, (newVal, oldVal) => {
+    //   console.log("数据变了1", newVal, oldVal);
+    // }, {
+    //   flush: 'post'
+    // });
+
+    watch(
+      obj,
+      () => {
+        console.log("数据变了1");
+      },
+      {
+        flush: "post",
+      }
+    );
+    watch(obj, () => {
+      console.log("数据变了2");
+    });
+    // watch(
+    //   () => obj.foo,
+    //   (newVal, oldVal) => {
+    //     console.log("数据变了2", newVal, oldVal);
+    //   }
+    // );
+    obj.foo++;
+
+    // watch(
+    //   () => obj.foo,
+    //   (newVal, oldVal) => {
+    //     console.log("数据变了", newVal, oldVal);
+    //   },
+    //   { immediate: true, flush: 'post' }
+    // );
+
+    // obj.foo++;
+    // obj.foo++;
+    // obj.foo++;
+    // obj.bar++;
+
+  </script>
+</html>
