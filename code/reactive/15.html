@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>数组的索引与 length</title>
+  </head>
+  <body></body>
+
+  <script>
+    // 用一个全局变量存储被注册的副作用函数
+    let activeEffect;
+    // effect 栈
+    const effectStack = [];
+    // effect 函数用于注册副作用函数
+    function effect(fn, options = {}) {
+      const effectFn = () => {
+        cleanup(effectFn);
+        // 当 effectFn 执行时，将其设置为当前激活的副作用函数
+        activeEffect = effectFn;
+        // 在调用副作用函数前，将当前副作用函数压栈
+        effectStack.push(activeEffect);
+        const res = fn();
+        // 在当前副作用函数执行完毕后，将当前副作用函数弹出栈，并将 activeEffect 还原为之前的值
+        effectStack.pop();
+        activeEffect = effectStack[effectStack.length - 1];
+        return res;
+      };
+      // 将 options 挂载到 effectFn 上
+      effectFn.options = options;
+      // 用于存储所有与该副作用函数相关的依赖集合
+      effectFn.deps = [];
+      if (!options.lazy) {
+        // 执行副作用函数
+        effectFn();
+      }
+      return effectFn;
+    }
+
+    // 存储副作用函数的桶
+    // WeakMap: target -> Map
+    // Map: key -> Set
+    const bucket = new WeakMap();
+    const ITERATE_KEY = Symbol();
+    function createReactive(data, isShallow = false, isReadonly = false) {
+      // 对原始数据进行代理
+      return new Proxy(data, {
+        // 拦截读取操作
+        get(target, key, receiver) {
+          // 代理对象可以通过 raw 属性访问原始数据
+          if (key === "raw") {
+            return target;
+          }
+
+          // 只有非只读的时候，才需要建立响应联系
+          if (!isReadonly) {
+            // 将副作用函数 activeEffect 添加到桶中
+            track(target, key);
+          }
+
+          // 得到原始值结果
+          const res = Reflect.get(target, key, receiver);
+          //  如果是浅响应，则直接返回原始值
+          if (isShallow) {
+            return res;
+          }
+          if (typeof res === "object" && res !== null) {
+            // 如果数据为只读，则调用 readonly 对值进行包装
+            // 否则，调用 reactive 将结果包装成响应式数据
+            return isReadonly ? readonly(res) : reactive(res);
+          }
+          // 返回结果
+          return res;
+        },
+        // 拦截设置操作
+        set(target, key, newVal, receiver) {
+          // 如果是只读的，则打印警告信息并返回
+          if (isReadonly) {
+            console.warn(`属性 ${key} 是只读的`);
+            return true;
+          }
+          const oldVal = target[key];
+          const type = Array.isArray(target)
+            ? // 如果代理目标是数组，则检测被设置的索引值是否小于数组长度
+              // 如果是，则视作 SET 操作，否则是 ADD 操作
+              Number(key) < target.length
+              ? "SET"
+              : "ADD"
+            : Object.prototype.hasOwnProperty.call(target, key)
+            ? "SET"
+            : "ADD";
+          // 设置属性值
+          const res = Reflect.set(target, key, newVal, receiver);
+          // receiver 就是 target 的代理对像
+          if (target === receiver.raw) {
+            // 比较新值与旧值，只有当它们不全等，并且不都是 NaN 的时候才触发响应
+            if (oldVal !== newVal && (oldVal === oldVal || newVal === newVal)) {
+              // 增加第四个参数，即触发响应的新值
+              trigger(target, key, type, newVal);
+            }
+          }
+          return res;
+        },
+        // key in target
+        has(target, key) {
+          track(target, key);
+          return Reflect.has(target, key);
+        },
+        // for ... in
+        ownKeys(target) {
+          track(target, ITERATE_KEY);
+          return Reflect.ownKeys(target);
+        },
+        // delete target.key
+        deleteProperty(target, key) {
+          // 如果是只读的，则打印警告信息并返回
+          if (isReadonly) {
+            console.warn(`属性 ${key} 是只读的`);
+            return true;
+          }
+          const hasKey = Object.prototype.hasOwnProperty.call(target, key);
+          const res = Reflect.deleteProperty(target, key);
+          if (res && hasKey) {
+            trigger(target, key, "DELETE");
+          }
+        },
+      });
+    }
+
+    function reactive(data) {
+      return createReactive(data);
+    }
+
+    function shallowReactive(data) {
+      return createReactive(data, true);
+    }
+
+    function readonly(data) {
+      return createReactive(data, false, true);
+    }
+
+    function shallowReadonly(data) {
+      return createReactive(data, true, true);
+    }
+
+    // 在 get 拦截函数内调用 track 函数，追踪变化
+    function track(target, key) {
+      // 没有 activeEffect 直接返回对应的值
+      if (!activeEffect) return;
+
+      // 根据 target 从桶中获取 depsMap
+      let depsMap = bucket.get(target);
+      // 如果不存在，那么新建一个 Map 和 target 进行关联
+      if (!depsMap) {
+        bucket.set(target, (depsMap = new Map()));
+      }
+
+      // 再根据 key 从 depsMap 中获取 deps
+      let deps = depsMap.get(key);
+      // 若 deps 不存在，则创建一个 Set 和 key 进行关联
+      if (!deps) {
+        depsMap.set(key, (deps = new Set()));
+      }
+      // 将当前副作用函数添加桶里
+      deps.add(activeEffect);
+
+      activeEffect.deps.push(deps);
+    }
+
+    // 在 set 拦截函数内调用 trigger 函数，触发变化
+    function trigger(target, key, type, newVal) {
+      // 根据 target 从桶中获取 depsMap
+      const depsMap = bucket.get(target);
+      if (!depsMap) return;
+      // 根据 key 取得所有副作用函数 effets
+      const effects = depsMap.get(key);
+
+      const effectsToRun = new Set();
+      effects &&
+        effects.forEach((effectFn) => {
+          // 如果 trigger 触发执行的副作用函数和当前正在执行的副作用函数相同，则不触发执行
+          if (effectFn !== activeEffect) {
+            effectsToRun.add(effectFn);
+          }
+        });
+
+      if (type === "ADD" || type === "DELETE") {
+        // 将与 ITERATE_KEY 相关联的副作用函数也添加到 effectsToRun
+        const iterateEffects = depsMap.get(ITERATE_KEY);
+        iterateEffects &&
+          iterateEffects.forEach((effectFn) => {
+            if (effectFn !== activeEffect) {
+              effectsToRun.add(effectFn);
+            }
+          });
+      }
+
+      // 当操作类型是 ADD 类型，并且目标对象时数组，，应该取出并执行那些与 length 相关的 effect 函数
+      if (type === "ADD" && Array.isArray(target)) {
+        const lengthEffects = depsMap.get("length");
+        lengthEffects &&
+          lengthEffects.forEach((effectFn) => {
+            if (effectFn !== activeEffect) {
+              effectsToRun.add(effectFn);
+            }
+          });
+      }
+
+      // 如果操作目标是数组，并且修改了数组的 length 属性
+      if (key === "length" && Array.isArray(target)) {
+        // 对于索引大于等于新的 length 值的元素
+        // 需要把所有相关的副作用函数取出并添加 effectsToRun 中待执行
+        depsMap.forEach((effects, key) => {
+          if (key >= newVal) {
+            effects.forEach((effectFn) => {
+              if (effectFn !== activeEffect) {
+                effectsToRun.add(effectFn);
+              }
+            });
+          }
+        });
+      }
+
+      // 执行副作用函数
+      effectsToRun.forEach((effectFn) => {
+        // 如果一个副作用函数存在调度器，则调用该调度器，并将副作用函数作为参数传递
+        if (effectFn.options.scheduler) {
+          effectFn.options.scheduler(effectFn);
+        } else {
+          // 否则直接执行副作用函数
+          effectFn();
+        }
+      });
+    }
+
+    function cleanup(effectFn) {
+      for (let index = 0; index < effectFn.deps.length; index++) {
+        const deps = effectFn.deps[index];
+        deps.delete(effectFn);
+      }
+
+      effectFn.deps.length = 0;
+    }
+
+    function computed(getter) {
+      // 对值进行缓存
+      let value;
+
+      // 标识是否需要重新计算
+      let dirty = true;
+
+      const effectFn = effect(getter, {
+        lazy: true,
+        scheduler() {
+          if (!dirty) {
+            dirty = true;
+            trigger(obj, "value");
+          }
+        },
+      });
+
+      const obj = {
+        get value() {
+          if (dirty) {
+            value = effectFn();
+            dirty = false;
+          }
+          track(obj, "value");
+          return value;
+        },
+      };
+      return obj;
+    }
+
+    function watch(source, cb, options = {}) {
+      let getter;
+      if (typeof source === "function") {
+        getter = source;
+      } else {
+        getter = () => traverse(source);
+      }
+
+      let oldVal, newVal;
+
+      let cleanup;
+      function onInvalidate(fn) {
+        cleanup = fn;
+      }
+      const job = () => {
+        newVal = effectFn();
+        if (cleanup) {
+          cleanup();
+        }
+        cb(newVal, oldVal, onInvalidate);
+        oldVal = newVal;
+      };
+      const effectFn = effect(() => getter(), {
+        lazy: true,
+        scheduler: () => {
+          if (options.flush === "post") {
+            const p = Promise.resolve();
+            p.then(job);
+          } else {
+            job();
+          }
+        },
+      });
+      if (options.immediate) {
+        job();
+      } else {
+        oldVal = effectFn();
+      }
+    }
+
+    function traverse(value, seen = new Set()) {
+      if (typeof value !== "object" || value === null || seen.has(value)) {
+        return;
+      }
+
+      seen.add(value);
+
+      for (const key in value) {
+        traverse(value[key], seen);
+      }
+      return value;
+    }
+
+    // const obj = reactive(["foo"]);
+    // effect(() => {
+    //   console.log(obj[0]);
+    // });
+    // obj[0] = "bar";
+
+    // const obj = reactive(["foo"]);
+    // effect(() => {
+    //   console.log(obj.length);
+    // });
+    // obj[1] = "bar";
+
+    const obj = reactive(["foo"]);
+    effect(() => {
+      console.log(obj[0]);
+    });
+    obj.length = 0;
+  </script>
+</html>
